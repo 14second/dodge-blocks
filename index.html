@@ -1,0 +1,480 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<meta name="theme-color" content="#0e1420">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="apple-touch-icon" href="icon-512.png">
+<title>Dodge the Falling Blocks — a tiny survival game</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  html, body { height:100%; }
+  body {
+    background:#0e1420;
+    display:flex; flex-direction:column; align-items:center; justify-content:center;
+    font-family:"Segoe UI", system-ui, -apple-system, sans-serif;
+    color:#e8eef7; overflow:hidden;
+    -webkit-user-select:none; user-select:none;
+    touch-action:none;
+  }
+  h1 { font-size:clamp(20px,4vw,34px); letter-spacing:2px; margin-bottom:4px; font-weight:800; }
+  h1 .accent { color:#2dd4bf; }
+  p.sub { color:#8b98ad; font-size:clamp(12px,2vw,15px); margin-bottom:14px; }
+  #wrap { position:relative; width:min(96vw, 1060px); }
+  canvas {
+    width:100%; height:auto; display:block; border-radius:14px;
+    box-shadow:0 18px 60px rgba(0,0,0,.55), 0 0 0 1px rgba(255,255,255,.06);
+    background:#dff3fa; cursor:pointer;
+  }
+  #hint { margin-top:10px; color:#8b98ad; font-size:13px; text-align:center; }
+  kbd { background:#1c2534; border:1px solid #33405a; border-bottom-width:3px; border-radius:6px;
+        padding:1px 8px; font-family:inherit; font-size:12px; color:#dbe4f0; }
+</style>
+</head>
+<body>
+  <h1>DODGE THE <span class="accent">FALLING BLOCKS</span></h1>
+  <p class="sub">a tiny survival game &mdash; how long can you last?</p>
+  <div id="wrap"><canvas id="game" width="960" height="540"></canvas></div>
+  <p id="hint"><kbd>&larr;</kbd> <kbd>&rarr;</kbd> / <kbd>A</kbd> <kbd>D</kbd> / drag to move &nbsp;&middot;&nbsp; <kbd>M</kbd> mute &nbsp;&middot;&nbsp; <kbd>R</kbd> restart</p>
+<script>
+"use strict";
+/* ============================================================
+   DODGE THE FALLING BLOCKS — a tiny survival game.
+   Steer the little ship, dodge everything that falls,
+   and chase your best time. No dependencies.
+   Tweak the CONFIG block to change the feel.
+   ============================================================ */
+const CONFIG = {
+  shipW: 54,            // ship hitbox width (drawn a touch bigger)
+  shipH: 40,
+  shipY: 486,           // ship's baseline (its bottom sits here)
+  shipSpeed: 620,       // px/s keyboard steering speed
+  startFall: 215,       // px/s blocks fall at the start
+  maxFall: 560,         // px/s cap
+  fallAccel: 6.5,       // extra px/s of fall speed per second survived
+  startGap: 0.92,       // seconds between block spawns at the start
+  minGap: 0.30,         // fastest spawn interval
+  gapShrink: 0.011,     // seconds shaved off the gap per second survived
+  blockMin: 26,         // smallest block edge (px)
+  blockMax: 46,         // largest block edge (px)
+};
+
+const cv = document.getElementById("game");
+const ctx = cv.getContext("2d");
+const wrap = document.getElementById("wrap");
+const hintEl = document.getElementById("hint");
+const h1El = document.querySelector("h1");
+const subEl = document.querySelector("p.sub");
+const demo = new URLSearchParams(location.search).has("demo");
+
+// ---------- responsive field ----------
+// The playfield adapts to the space on offer. Wide screens keep the
+// classic 960x540 field exactly; narrow/portrait screens (phones) get
+// a tall field that fills the available space. Every gameplay value
+// derives from the live W/H through the scales below, and every scale
+// is exactly 1 at 960x540 — so desktop physics/rendering never change.
+let W = cv.width, H = cv.height;
+let S = 1;               // sprite scale: min(W,H)/540
+let VS = 1;              // vertical speed scale: H/540
+let shipY = CONFIG.shipY; // ship baseline for the current field height
+let shipWCur = CONFIG.shipW, shipHCur = CONFIG.shipH;
+let shipSpeedCur = CONFIG.shipSpeed;
+let gapScale = 1;        // spawn-gap compensation on narrow fields
+
+function updateScales() {
+  S = Math.min(W, H) / 540;
+  VS = H / 540;
+  shipY = H - Math.round(54 * S);
+  shipWCur = Math.round(CONFIG.shipW * S);
+  shipHCur = Math.round(CONFIG.shipH * S);
+  shipSpeedCur = CONFIG.shipSpeed * (W / 960);
+  gapScale = W < 960 ? Math.max(1, Math.min(1.8, 960 / W * 0.68)) : 1;
+}
+
+function fit() {
+  const oldW = W, oldH = H, oldS = S, oldVS = VS;
+  const wrapW = wrap.clientWidth || Math.min(innerWidth * 0.96, 1060);
+  const above = h1El.offsetHeight + subEl.offsetHeight + 18; // header + margins
+  const below = hintEl.offsetHeight + 12;
+  const availH = Math.max(300, innerHeight - above - below);
+  let gw, gh;
+  if (wrapW < 900 && wrapW / availH < 4 / 3) {
+    gw = Math.max(280, Math.round(wrapW));           // portrait: fill the space
+    gh = Math.round(availH);
+  } else {
+    gw = 960; gh = 540;                              // classic field
+  }
+  gh = Math.min(gh, Math.round(gw * 2.2));
+  if (gw === W && gh === H) { updateScales(); return; }
+  cv.width = gw; cv.height = gh; W = gw; H = gh;
+  updateScales();
+  // rescale a run in progress into the new field
+  const kx = W / oldW, ky = H / oldH;
+  ship.x *= kx; if (ship.targetX !== null) ship.targetX *= kx;
+  for (const b of blocks) { b.x *= kx; b.y *= ky; b.s *= S / oldS; b.vy *= VS / oldVS; }
+  initStars();
+}
+let fitTimer = null;
+addEventListener("resize", () => { clearTimeout(fitTimer); fitTimer = setTimeout(fit, 120); });
+addEventListener("orientationchange", () => setTimeout(fit, 80));
+
+// ---------- tiny synth ----------
+let AC = null, muted = false;
+function beep(freq, dur, type, vol, slide) {
+  if (muted) return;
+  try {
+    AC = AC || new (window.AudioContext || window.webkitAudioContext)();
+    const o = AC.createOscillator(), g = AC.createGain();
+    o.type = type || "sine"; o.frequency.setValueAtTime(freq, AC.currentTime);
+    if (slide) o.frequency.exponentialRampToValueAtTime(slide, AC.currentTime + dur);
+    g.gain.setValueAtTime(vol || 0.12, AC.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.0001, AC.currentTime + dur);
+    o.connect(g); g.connect(AC.destination);
+    o.start(); o.stop(AC.currentTime + dur);
+  } catch (e) {}
+}
+const sfx = {
+  dodge: () => beep(660, 0.07, "sine", 0.045, 880),
+  ding:  () => { beep(880, 0.09, "sine", 0.08); setTimeout(() => beep(1320, 0.12, "sine", 0.08), 90); },
+  crash: () => beep(170, 0.30, "sawtooth", 0.11, 55),
+  start: () => beep(520, 0.10, "triangle", 0.08, 780),
+};
+
+// ---------- state ----------
+let state = "menu";           // menu | play | dead
+let t = 0, survived = 0, dodged = 0, score = 0;
+let hi = +(localStorage.getItem("dodgeblocks_hi") || 0);
+let fallSpeed = CONFIG.startFall, spawnGap = CONFIG.startGap, spawnT = 0;
+let lastMilestone = 0, flash = 0, shake = 0, deadT = 0;
+
+const ship = { x: W / 2, targetX: null, dead: false, tilt: 0 };
+let blocks = [];              // {x, y, s, vy, rot, hue}
+let stars = [];               // drifting background specks {x,y,s,v}
+let puffs = [];               // crash particles {x,y,vx,vy,life}
+const keys = { left: false, right: false };
+
+function reset() {
+  state = "play"; t = 0; survived = 0; dodged = 0; score = 0;
+  lastMilestone = 0; flash = 0; shake = 0; deadT = 0;
+  fallSpeed = CONFIG.startFall * VS; spawnGap = CONFIG.startGap * gapScale; spawnT = 0.55;
+  ship.x = W / 2; ship.targetX = null; ship.dead = false; ship.tilt = 0;
+  blocks = []; puffs = []; drag = null;
+  sfx.start();
+}
+
+function initStars() {
+  stars = [];
+  const n = Math.max(20, Math.min(90, Math.round(46 * (W * H) / (960 * 540))));
+  for (let i = 0; i < n; i++) stars.push({ x: Math.random() * W, y: Math.random() * H, s: 1 + Math.random() * 2.2, v: 14 + Math.random() * 30 });
+}
+
+// ---------- input ----------
+function startOrRestart() { if (state !== "play") reset(); }
+addEventListener("keydown", e => {
+  if (e.code === "ArrowLeft" || e.code === "KeyA") { keys.left = true; e.preventDefault(); }
+  if (e.code === "ArrowRight" || e.code === "KeyD") { keys.right = true; e.preventDefault(); }
+  if (e.repeat) return;
+  if (e.code === "Space" || e.code === "Enter") { e.preventDefault(); startOrRestart(); }
+  if (e.code === "KeyR" && state !== "menu") reset();
+  if (e.code === "KeyM") muted = !muted;
+});
+addEventListener("keyup", e => {
+  if (e.code === "ArrowLeft" || e.code === "KeyA") keys.left = false;
+  if (e.code === "ArrowRight" || e.code === "KeyD") keys.right = false;
+});
+function pointerX(e) {
+  const r = cv.getBoundingClientRect();
+  return (e.clientX - r.left) * (W / r.width);
+}
+function clampTarget(x) {
+  const half = shipWCur / 2;
+  return Math.max(half + 4, Math.min(W - half - 4, x));
+}
+// Touch steering is RELATIVE: the ship follows the finger's horizontal
+// movement (delta from where the drag started), so the finger never has
+// to sit on top of the ship and hide it. Mouse keeps the original
+// absolute "ship glides to the pointer" behaviour.
+let drag = null; // {id, startX, startShipX, touch}
+cv.addEventListener("pointerdown", e => {
+  e.preventDefault();
+  if (state !== "play") { startOrRestart(); return; }
+  const px = pointerX(e);
+  drag = { id: e.pointerId, startX: px, startShipX: ship.targetX !== null ? ship.targetX : ship.x, touch: e.pointerType === "touch" };
+  if (!drag.touch) ship.targetX = clampTarget(px);
+});
+cv.addEventListener("pointermove", e => {
+  if (state !== "play" || !drag || e.pointerId !== drag.id) return;
+  if (!drag.touch && !e.buttons) return;
+  const px = pointerX(e);
+  ship.targetX = clampTarget(drag.touch ? drag.startShipX + (px - drag.startX) : px);
+});
+addEventListener("pointerup", e => { if (drag && e.pointerId === drag.id) drag = null; });
+addEventListener("pointercancel", e => { if (drag && e.pointerId === drag.id) drag = null; });
+addEventListener("blur", () => { keys.left = keys.right = false; });
+
+// ---------- spawning ----------
+function spawnBlock() {
+  const s = (CONFIG.blockMin + Math.random() * (CONFIG.blockMax - CONFIG.blockMin)) * S;
+  blocks.push({
+    x: 10 + Math.random() * (W - s - 20),
+    y: -s - 4,
+    s,
+    vy: fallSpeed * (0.88 + Math.random() * 0.28),
+    rot: (Math.random() - 0.5) * 0.14,
+    hue: [16, 28, 199, 217][Math.floor(Math.random() * 4)], // coral, amber, teal, blue
+  });
+}
+
+// ---------- demo autopilot: potential-field steering ----------
+// Every falling block repels the ship sideways (stronger as it gets
+// closer); a gentle spring pulls toward the middle. The ship dodges
+// into the gaps the field leaves open.
+function demoSteer(dt) {
+  const shipTop = shipY - shipHCur;
+  let force = (W / 2 - ship.x) * 0.35; // centering spring
+  for (const b of blocks) {
+    const bc = b.x + b.s / 2;
+    const dy = shipTop - (b.y + b.s); // >0 while the block is above the ship
+    if (dy < 340 * VS && dy > -70 * VS) {
+      const dx = ship.x - bc;
+      const reach = b.s / 2 + shipWCur / 2 + 30 * S;
+      const closeness = Math.max(0, reach + 70 * S - Math.abs(dx));
+      if (closeness > 0) {
+        const urgency = 1.4 - Math.max(0, dy) / (340 * VS); // 0.4 .. 1.4
+        const dir = dx !== 0 ? Math.sign(dx) : (bc < W / 2 ? 1 : -1);
+        force += dir * closeness * urgency * 6;
+      }
+    }
+  }
+  const maxV = shipSpeedCur * 1.5; // demo reflexes are a bit superhuman
+  const vx = Math.max(-maxV, Math.min(maxV, force));
+  ship.x += vx * dt;
+}
+
+// ---------- update ----------
+function update(dt) {
+  t += dt;
+  for (const s of stars) { s.y += (state === "play" ? fallSpeed * 0.16 : 16) * dt + s.v * dt; if (s.y > H + 4) { s.y = -4; s.x = Math.random() * W; } }
+  if (state !== "play") { if (demo && state === "dead" && deadT > 1.2) reset(); return; }
+
+  survived += dt;
+  fallSpeed = Math.min(CONFIG.maxFall, CONFIG.startFall + CONFIG.fallAccel * survived) * VS;
+  spawnGap = Math.max(CONFIG.minGap, CONFIG.startGap - CONFIG.gapShrink * survived) * gapScale;
+
+  // steering
+  let move = 0;
+  if (demo) demoSteer(dt);
+  else {
+    if (keys.left) move -= 1;
+    if (keys.right) move += 1;
+    if (move) { ship.x += move * shipSpeedCur * dt; ship.targetX = null; }
+    else if (ship.targetX !== null) {
+      const dx = ship.targetX - ship.x;
+      const step = shipSpeedCur * 1.6 * dt;
+      ship.x += Math.max(-step, Math.min(step, dx));
+      if (Math.abs(dx) < 2) ship.targetX = null;
+    }
+  }
+  const half = shipWCur / 2;
+  ship.x = Math.max(half + 4, Math.min(W - half - 4, ship.x));
+  ship.tilt = move * 0.16 || (ship.targetX !== null ? Math.sign(ship.targetX - ship.x) * 0.08 : ship.tilt * 0.85);
+
+  // spawn + fall
+  spawnT -= dt;
+  if (spawnT <= 0) { spawnBlock(); spawnT = spawnGap * (0.7 + Math.random() * 0.6); }
+  for (const b of blocks) b.y += b.vy * dt;
+  const before = blocks.length;
+  blocks = blocks.filter(b => b.y < H + 8);
+  const passed = before - blocks.length;
+  if (passed > 0) { dodged += passed; if (!demo) sfx.dodge(); }
+  score = Math.floor(survived) * 10 + dodged * 5;
+  if (score - lastMilestone >= 250) { lastMilestone = score - (score % 250); flash = 0.5; sfx.ding(); }
+
+  // --- collisions (forgiving hitbox, shrunk ~15%) ---
+  const sx = ship.x - shipWCur / 2 + 8 * S, sw = shipWCur - 16 * S;
+  const sy = shipY - shipHCur + 8 * S, sh = shipHCur - 12 * S;
+  for (const b of blocks) {
+    const bx = b.x + 4, bw = b.s - 8, by = b.y + 4, bh = b.s - 8;
+    if (sx < bx + bw && sx + sw > bx && sy < by + bh && sy + sh > by) {
+      state = "dead"; deadT = 0; ship.dead = true; shake = 0.5; sfx.crash();
+      if (score > hi) { hi = score; localStorage.setItem("dodgeblocks_hi", hi); }
+      for (let i = 0; i < 16; i++) puffs.push({ x: ship.x, y: shipY - 20 * S, vx: (-170 + Math.random() * 340) * S, vy: (-220 + Math.random() * 160) * S, life: 0.8 });
+      break;
+    }
+  }
+  for (const p of puffs) { p.x += p.vx * dt; p.y += p.vy * dt; p.vy += 560 * S * dt; p.life -= dt; }
+  puffs = puffs.filter(p => p.life > 0);
+  flash -= dt; shake -= dt;
+}
+
+// ---------- drawing ----------
+function bgGradient() {
+  const g = ctx.createLinearGradient(0, 0, 0, H);
+  g.addColorStop(0, "#dff3fa");
+  g.addColorStop(0.75, "#eefaf5");
+  g.addColorStop(1, "#d9f2e4");
+  return g;
+}
+
+function rrect(x, y, w, h, r) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + w, y, x + w, y + h, r);
+  ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r);
+  ctx.arcTo(x, y, x + w, y, r);
+  ctx.closePath();
+}
+
+function drawBlock(b) {
+  ctx.save();
+  ctx.translate(b.x + b.s / 2, b.y + b.s / 2);
+  ctx.rotate(b.rot);
+  ctx.fillStyle = "rgba(0,0,0,.10)";
+  rrect(-b.s / 2 + 3, -b.s / 2 + 5, b.s, b.s, 9); ctx.fill();
+  const grd = ctx.createLinearGradient(0, -b.s / 2, 0, b.s / 2);
+  grd.addColorStop(0, `hsl(${b.hue} 85% 62%)`);
+  grd.addColorStop(1, `hsl(${b.hue} 78% 48%)`);
+  ctx.fillStyle = grd;
+  rrect(-b.s / 2, -b.s / 2, b.s, b.s, 9); ctx.fill();
+  ctx.fillStyle = "rgba(255,255,255,.35)";
+  rrect(-b.s / 2 + 6, -b.s / 2 + 6, b.s - 12, b.s * 0.32, 6); ctx.fill();
+  ctx.restore();
+}
+
+function drawShip() {
+  ctx.save();
+  ctx.translate(ship.x, shipY);
+  if (shake > 0) ctx.translate((Math.random() - 0.5) * 9 * shake, (Math.random() - 0.5) * 9 * shake);
+  ctx.rotate(ship.dead ? 0.5 : ship.tilt);
+  ctx.scale(S, S); // ship art below is drawn in classic 960x540 units
+  // shadow
+  ctx.fillStyle = "rgba(0,0,0,.12)";
+  ctx.beginPath(); ctx.ellipse(0, 8, 30, 6, 0, 0, 7); ctx.fill();
+  // flame (flickers while alive)
+  if (!ship.dead) {
+    const fl = 12 + Math.sin(t * 34) * 4 + Math.random() * 3;
+    ctx.fillStyle = "#f59e0b";
+    ctx.beginPath(); ctx.moveTo(-8, -2); ctx.lineTo(0, fl + 4); ctx.lineTo(8, -2); ctx.closePath(); ctx.fill();
+    ctx.fillStyle = "#fde68a";
+    ctx.beginPath(); ctx.moveTo(-4, -2); ctx.lineTo(0, fl - 3); ctx.lineTo(4, -2); ctx.closePath(); ctx.fill();
+  }
+  // fins
+  ctx.fillStyle = "#0ea5e9";
+  ctx.beginPath(); ctx.moveTo(-16, -14); ctx.lineTo(-30, 0); ctx.lineTo(-15, 0); ctx.closePath(); ctx.fill();
+  ctx.beginPath(); ctx.moveTo(16, -14); ctx.lineTo(30, 0); ctx.lineTo(15, 0); ctx.closePath(); ctx.fill();
+  // body
+  const grd = ctx.createLinearGradient(0, -46, 0, 0);
+  grd.addColorStop(0, "#2dd4bf"); grd.addColorStop(1, "#0d9488");
+  ctx.fillStyle = grd;
+  ctx.beginPath();
+  ctx.moveTo(0, -46);
+  ctx.quadraticCurveTo(17, -26, 15, -2);
+  ctx.lineTo(-15, -2);
+  ctx.quadraticCurveTo(-17, -26, 0, -46);
+  ctx.fill();
+  // window
+  ctx.fillStyle = "#e0f2fe";
+  ctx.beginPath(); ctx.arc(0, -26, 7.5, 0, 7); ctx.fill();
+  ctx.fillStyle = "#0284c7";
+  ctx.beginPath(); ctx.arc(0, -26, 4.2, 0, 7); ctx.fill();
+  ctx.restore();
+}
+
+function drawPuffs() {
+  for (const p of puffs) {
+    ctx.fillStyle = `rgba(100,116,139,${Math.max(0, p.life)})`;
+    ctx.beginPath(); ctx.arc(p.x, p.y, 3 + (0.8 - p.life) * 9, 0, 7); ctx.fill();
+  }
+}
+
+function drawHUD() {
+  const fs = Math.min(1, Math.max(S, 0.85)); // HUD type scale (1 on desktop)
+  ctx.textAlign = "right";
+  ctx.fillStyle = "#2b3648";
+  ctx.font = `700 ${26 * fs}px 'Segoe UI', system-ui, sans-serif`;
+  ctx.fillText(String(score).padStart(5, "0"), W - 24 * fs, 44 * fs);
+  ctx.font = `600 ${15 * fs}px 'Segoe UI', system-ui, sans-serif`;
+  ctx.fillStyle = "#5b6b82";
+  ctx.fillText("HI " + String(Math.max(hi, score)).padStart(5, "0"), W - 24 * fs, 68 * fs);
+  ctx.textAlign = "left";
+  ctx.fillText("TIME " + survived.toFixed(1) + "s", 24 * fs, 44 * fs);
+  ctx.fillText("DODGED " + dodged, 24 * fs, 68 * fs);
+  if (muted) ctx.fillText("muted (M)", 24 * fs, 92 * fs);
+  if (flash > 0) { ctx.fillStyle = `rgba(255,255,255,${flash * 0.7})`; ctx.fillRect(0, 0, W, H); }
+}
+
+function centerText(main, sub, mainSize) {
+  const ts = Math.min(1, (W - 40) / 520);        // title scale (1 on desktop)
+  const k = Math.max(ts, 0.8);                    // panel/offset scale
+  ctx.textAlign = "center";
+  ctx.fillStyle = "rgba(20,28,40,.74)";
+  const w = Math.min(520, W - 24), h = (sub ? 196 : 116) * k;
+  rrect(W / 2 - w / 2, H / 2 - h / 2 - 30 * k, w, h, 18); ctx.fill();
+  ctx.fillStyle = "#fff";
+  ctx.font = `800 ${(mainSize || 42) * ts}px 'Segoe UI', system-ui, sans-serif`;
+  ctx.fillText(main, W / 2, H / 2 - (sub ? 20 : 2) * k);
+  if (sub) {
+    ctx.font = `400 ${19 * k}px 'Segoe UI', system-ui, sans-serif`;
+    ctx.fillStyle = "#cdd8e6";
+    ctx.fillText(sub, W / 2, H / 2 + 26 * k);
+    ctx.font = `600 ${16 * k}px 'Segoe UI', system-ui, sans-serif`;
+    ctx.fillStyle = "#8fa1b8";
+    ctx.fillText("SPACE / tap to start", W / 2, H / 2 + 58 * k);
+  }
+}
+
+function draw() {
+  ctx.save();
+  ctx.fillStyle = bgGradient();
+  ctx.fillRect(0, 0, W, H);
+  // drifting specks
+  ctx.fillStyle = "rgba(14,165,233,.20)";
+  for (const s of stars) { ctx.beginPath(); ctx.arc(s.x, s.y, s.s, 0, 7); ctx.fill(); }
+  // floor line
+  ctx.fillStyle = "#99d5b8"; ctx.fillRect(0, shipY + 14 * S, W, Math.max(2, 4 * S));
+  ctx.fillStyle = "rgba(20,184,166,.10)"; ctx.fillRect(0, shipY + 18 * S, W, H - shipY - 18 * S);
+  for (const b of blocks) drawBlock(b);
+  drawPuffs();
+  drawShip();
+  drawHUD();
+  if (state === "menu") {
+    centerText("DODGE THE BLOCKS", "steer the ship — don't get squashed", 46);
+  } else if (state === "dead") {
+    deadT += 1 / 60;
+    if (deadT > 0.5) {
+      const isHi = score >= hi && score > 0;
+      centerText("GAME OVER", `score ${score} · ${survived.toFixed(1)}s · ${dodged} dodged` + (isHi ? " · new best!" : ` · best ${hi}`), 44);
+    }
+  }
+  ctx.restore();
+}
+
+// ---------- main loop (fixed timestep) ----------
+let last = performance.now(), acc = 0;
+const STEP = 1 / 120;
+function frame(now) {
+  let dt = (now - last) / 1000; last = now;
+  if (dt > 0.25) dt = 0.25;
+  acc += dt;
+  while (acc >= STEP) { update(STEP); acc -= STEP; }
+  draw();
+  requestAnimationFrame(frame);
+}
+initStars();
+fit();
+if (demo) { setTimeout(() => { if (state === "menu") reset(); }, 600); }
+// hook for automated capture / debugging
+window.__dodgeblocks = {
+  get state() { return state; }, get score() { return score; },
+  get survived() { return survived; }, get dodged() { return dodged; },
+  ship, get blocks() { return blocks; },
+};
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
