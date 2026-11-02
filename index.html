@@ -122,12 +122,24 @@ let fitTimer = null;
 addEventListener("resize", () => { clearTimeout(fitTimer); fitTimer = setTimeout(fit, 120); });
 addEventListener("orientationchange", () => setTimeout(fit, 80));
 
+// ---------- iOS audio routing ----------
+// Web Audio defaults to the "ambient" channel, which the iPhone silent
+// switch mutes entirely. Route it to the media/playback channel (iOS 17+
+// Audio Session API) on the first user gesture and inside the synth.
+function iosPlaybackSession() {
+  try { if ('audioSession' in navigator) navigator.audioSession.type = 'playback'; } catch (e) {}
+}
+document.addEventListener('pointerdown', iosPlaybackSession, true);
+document.addEventListener('touchstart', iosPlaybackSession, true);
+
 // ---------- tiny synth ----------
 let AC = null, muted = false;
 function beep(freq, dur, type, vol, slide) {
   if (muted) return;
   try {
+    iosPlaybackSession();
     AC = AC || new (window.AudioContext || window.webkitAudioContext)();
+    if (AC.state === "suspended") AC.resume();
     const o = AC.createOscillator(), g = AC.createGain();
     o.type = type || "sine"; o.frequency.setValueAtTime(freq, AC.currentTime);
     if (slide) o.frequency.exponentialRampToValueAtTime(slide, AC.currentTime + dur);
